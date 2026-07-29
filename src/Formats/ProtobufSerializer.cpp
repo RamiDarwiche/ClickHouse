@@ -19,6 +19,8 @@
 #    include <DataTypes/DataTypeArray.h>
 #    include <DataTypes/DataTypeDateTime64.h>
 #    include <DataTypes/DataTypeEnum.h>
+#    include <DataTypes/DataTypeTime.h>
+#    include <DataTypes/DataTypeTime64.h>
 #    include <DataTypes/DataTypeFixedString.h>
 #    include <DataTypes/DataTypeLowCardinality.h>
 #    include <DataTypes/DataTypeMap.h>
@@ -1148,7 +1150,7 @@ namespace
 
 
     /// Serializes a ColumnDecimal<DecimalType> to any field except TYPE_MESSAGE, TYPE_GROUP, TYPE_ENUM.
-    /// DecimalType must be one of the following types: Decimal32, Decimal64, Decimal128, Decimal256, DateTime64.
+    /// DecimalType must be one of the following types: Decimal32, Decimal64, Decimal128, Decimal256, DateTime64, Time64.
     template <typename DecimalType>
     class ProtobufSerializerDecimal : public ProtobufSerializerSingleValue
     {
@@ -1301,7 +1303,7 @@ namespace
 
                 case FieldTypeId::TYPE_BOOL:
                 {
-                    if (std::is_same_v<DecimalType, DateTime64>)
+                    if constexpr (std::is_same_v<DecimalType, DateTime64> || std::is_same_v<DecimalType, Time64>)
                         incompatibleColumnType(TypeName<DecimalType>);
                     else
                     {
@@ -1384,6 +1386,8 @@ namespace
             WriteBufferFromString buf{str};
             if constexpr (std::is_same_v<DecimalType, DateTime64>)
                 writeDateTimeText(decimal, scale, buf);
+            else if constexpr (std::is_same_v<DecimalType, Time64>)
+                writeTime64Text(decimal, scale, buf);
             else
                 writeText(decimal, scale, buf, false);
         }
@@ -1394,6 +1398,8 @@ namespace
             DecimalType decimal{0};
             if constexpr (std::is_same_v<DecimalType, DateTime64>)
                 readDateTime64Text(decimal, scale, buf);
+            else if constexpr (std::is_same_v<DecimalType, Time64>)
+                readTime64Text(decimal, scale, buf);
             else
                 SerializationDecimal<DecimalType>::readText(decimal, buf, precision, scale);
             return decimal;
@@ -1409,6 +1415,7 @@ namespace
     };
 
     using ProtobufSerializerDateTime64 = ProtobufSerializerDecimal<DateTime64>;
+    using ProtobufSerializerTime64 = ProtobufSerializerDecimal<Time64>;
 
 
     /// Serializes a ColumnVector<UInt16> containing dates to a field of any type except TYPE_MESSAGE, TYPE_GROUP, TYPE_BOOL, TYPE_ENUM.
@@ -1721,6 +1728,87 @@ namespace
             time_t tm = 0;
             readDateTimeText(tm, buf, lut);
             return std::max<time_t>(tm, 0);
+        }
+    };
+
+
+    /// Serializes a ColumnVector<Int32> containing times to a field of any type except TYPE_MESSAGE, TYPE_GROUP, TYPE_BOOL, TYPE_ENUM.
+    class ProtobufSerializerTime : public ProtobufSerializerNumber<Int32>
+    {
+    public:
+        ProtobufSerializerTime(
+            std::string_view column_name_,
+            const FieldDescriptor & field_descriptor_,
+            const ProtobufReaderOrWriter & reader_or_writer_)
+            : ProtobufSerializerNumber<Int32>(column_name_, field_descriptor_, reader_or_writer_)
+        {
+            setFunctions();
+        }
+
+        void describeTree(WriteBuffer & out, size_t indent) const override
+        {
+            writeIndent(out, indent) << "ProtobufSerializerTime: column " << quoteString(column_name) << " -> field "
+                                     << quoteString(field_descriptor.full_name()) << " (" << field_descriptor.type_name() << ")\n";
+        }
+
+    private:
+        void setFunctions()
+        {
+            switch (field_typeid)
+            {
+                case FieldTypeId::TYPE_INT32:
+                case FieldTypeId::TYPE_SINT32:
+                case FieldTypeId::TYPE_UINT32:
+                case FieldTypeId::TYPE_INT64:
+                case FieldTypeId::TYPE_SINT64:
+                case FieldTypeId::TYPE_UINT64:
+                case FieldTypeId::TYPE_FIXED32:
+                case FieldTypeId::TYPE_SFIXED32:
+                case FieldTypeId::TYPE_FIXED64:
+                case FieldTypeId::TYPE_SFIXED64:
+                case FieldTypeId::TYPE_FLOAT:
+                case FieldTypeId::TYPE_DOUBLE:
+                    break; /// already set in ProtobufSerializerNumber<Int32>::setFunctions().
+
+                case FieldTypeId::TYPE_STRING:
+                case FieldTypeId::TYPE_BYTES:
+                {
+                    write_function = [this](Int32 value)
+                    {
+                        timeToString(value, text_buffer);
+                        writeStr(text_buffer);
+                    };
+
+                    read_function = [this]() -> Int32
+                    {
+                        readStr(text_buffer);
+                        return stringToTime(text_buffer);
+                    };
+
+                    default_function = [this]() -> Int32
+                    {
+                        return stringToTime(std::string(field_descriptor.default_value_string()));
+                    };
+                    break;
+                }
+
+                default:
+                    incompatibleColumnType("Time");
+            }
+        }
+
+        static void timeToString(time_t tm, String & str)
+        {
+            WriteBufferFromString buf{str};
+            writeTimeText(tm, buf);
+        }
+
+        static Int32 stringToTime(const String & str)
+        {
+            ReadBufferFromString buf{str};
+            time_t tm = 0;
+            readTimeText(tm, buf);
+            return static_cast<Int32>(tm);
         }
     };
 
@@ -3922,6 +4010,8 @@ namespace
                 case TypeIndex::Date: return std::make_unique<ProtobufSerializerDate>(column_name, field_descriptor, reader_or_writer);
                 case TypeIndex::DateTime: return std::make_unique<ProtobufSerializerDateTime>(column_name, assert_cast<const DataTypeDateTime &>(*data_type), field_descriptor, reader_or_writer);
                 case TypeIndex::DateTime64: return std::make_unique<ProtobufSerializerDateTime64>(column_name, assert_cast<const DataTypeDateTime64 &>(*data_type), field_descriptor, reader_or_writer);
+                case TypeIndex::Time: return std::make_unique<ProtobufSerializerTime>(column_name, field_descriptor, reader_or_writer);
+                case TypeIndex::Time64: return std::make_unique<ProtobufSerializerTime64>(column_name, assert_cast<const DataTypeTime64 &>(*data_type), field_descriptor, reader_or_writer);
                 case TypeIndex::String: return std::make_unique<ProtobufSerializerString<false>>(column_name, field_descriptor, reader_or_writer);
                 case TypeIndex::FixedString: return std::make_unique<ProtobufSerializerString<true>>(column_name, typeid_cast<std::shared_ptr<const DataTypeFixedString>>(data_type), field_descriptor, reader_or_writer);
                 case TypeIndex::Enum8: return std::make_unique<ProtobufSerializerEnum<Int8>>(column_name, typeid_cast<std::shared_ptr<const DataTypeEnum8>>(data_type), field_descriptor, reader_or_writer);
